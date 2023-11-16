@@ -10,6 +10,7 @@ type ECSService struct {
 	ID                           string // Service ARN
 	Name                         string // Name of the service
 	DesiredT, PendingT, RunningT int64  // Service task information
+	MinT, MaxT                   string //service configurations
 }
 
 // ECSCluster reprensens a cluster on ECS

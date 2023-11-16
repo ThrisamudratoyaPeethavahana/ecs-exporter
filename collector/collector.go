@@ -5,9 +5,13 @@ import (
 	"regexp"
 	"sync"
 	"time"
+	"strconv"
+    "fmt"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/version"
+	"github.com/aws/aws-sdk-go/aws/session"
 
 	"github.com/slok/ecs-exporter/log"
 	"github.com/slok/ecs-exporter/types"
@@ -59,6 +63,17 @@ var (
 		[]string{"region", "cluster", "service"}, nil,
 	)
 
+	serviceMin = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "service_min_tasks"),
+		"The minimum number of tasks in the cluster that must be in the running state regarding the service",
+		[]string{"region", "cluster", "service"}, nil,
+	)
+
+serviceMax = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", "service_max_tasks"),
+		"The maximum number of tasks in the cluster that could be in the running state regarding the service",
+		[]string{"region", "cluster", "service"}, nil,
+	)
 	//  Container instances metrics
 	cInstanceCount = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "container_instances"),
@@ -89,6 +104,7 @@ var (
 type Exporter struct {
 	sync.Mutex                   // Our exporter object will be locakble to protect from concurrent scrapes
 	client        ECSGatherer    // Custom ECS client to get information from the clusters
+	applicationAutoScalingClient *ApplicationAutoScalingClient // ApplicationAutoScaling Client to get congigurations for cluster
 	region        string         // The region where the exporter will scrape
 	clusterFilter *regexp.Regexp // Compiled regular expresion to filter clusters
 	noCIMetrics   bool           // Don't gather container instance metrics
@@ -97,7 +113,18 @@ type Exporter struct {
 
 // New returns an initialized exporter
 func New(awsRegion string, clusterFilterRegexp string, disableCIMetrics bool) (*Exporter, error) {
-	c, err := NewECSClient(awsRegion)
+	// Create AWS session
+	s := session.New(&aws.Config{Region: aws.String(awsRegion)})
+	if s == nil {
+		return nil, fmt.Errorf("error creating aws session")
+	}
+
+	c, err := NewECSClient(s)
+	if err != nil {
+		return nil, err
+	}
+
+	applicationAutoScalingClient, err := NewApplicationAutoScalingClient(s)
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +137,7 @@ func New(awsRegion string, clusterFilterRegexp string, disableCIMetrics bool) (*
 	return &Exporter{
 		Mutex:         sync.Mutex{},
 		client:        c,
+		applicationAutoScalingClient: applicationAutoScalingClient,
 		region:        awsRegion,
 		clusterFilter: cRegexp,
 		noCIMetrics:   disableCIMetrics,
@@ -145,6 +173,8 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- serviceDesired
 	ch <- servicePending
 	ch <- serviceRunning
+	ch <- serviceMin
+	ch <- serviceMax
 
 	if e.noCIMetrics {
 		return
@@ -189,7 +219,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		totalCs++
 		go func(c types.ECSCluster) {
 			// Get services
-			ss, err := e.client.GetClusterServices(&c)
+			ss, err := e.client.GetClusterServices(e.applicationAutoScalingClient, &c)
 			if err != nil {
 				errC <- true
 				log.Errorf("Error collecting cluster service metrics: %v", err)
@@ -249,6 +279,13 @@ func (e *Exporter) collectClusterMetrics(ctx context.Context, ch chan<- promethe
 	sendSafeMetric(ctx, ch, prometheus.MustNewConstMetric(clusterCount, prometheus.GaugeValue, float64(len(clusters)), e.region))
 }
 
+func sendServiceConfigMetricIfValid(ctx context.Context, ch chan<- prometheus.Metric, desc *prometheus.Desc, value string, region string, clusterName string, serviceName string) {
+    if metricValue, err := strconv.Atoi(value); err == nil {
+        metric := prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, float64(metricValue), region, clusterName, serviceName)
+        sendSafeMetric(ctx, ch, metric)
+    }
+}
+
 func (e *Exporter) collectClusterServicesMetrics(ctx context.Context, ch chan<- prometheus.Metric, cluster *types.ECSCluster, services []*types.ECSService) {
 
 	// Total services
@@ -263,6 +300,12 @@ func (e *Exporter) collectClusterServicesMetrics(ctx context.Context, ch chan<- 
 
 		// Running task count
 		sendSafeMetric(ctx, ch, prometheus.MustNewConstMetric(serviceRunning, prometheus.GaugeValue, float64(s.RunningT), e.region, cluster.Name, s.Name))
+
+		// Min task count
+		sendServiceConfigMetricIfValid(ctx, ch, serviceMin, s.MinT, e.region, cluster.Name, s.Name)
+
+		// Max task count
+		sendServiceConfigMetricIfValid(ctx, ch, serviceMax, s.MaxT, e.region, cluster.Name, s.Name)
 	}
 }
 

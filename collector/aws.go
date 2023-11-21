@@ -13,7 +13,11 @@ import (
 )
 
 const (
-	maxServicesAPI = 10
+	maxServicesAPI = 50
+)
+
+const (
+	maxDescribeServicesAPI = 10
 )
 
 // ECSGatherer is the interface that implements the methods required to gather ECS data
@@ -164,22 +168,36 @@ func (e *ECSClient) GetClusterServices(autoScalingClient *ApplicationAutoScaling
 		// Make a call on goroutine for each service blocks
 		go func(services []*string) {
 			log.Debugf("Getting service descriptions for cluster: %s", cluster.Name)
-			params := &ecs.DescribeServicesInput{
-				Services: services,
-				Cluster:  aws.String(cluster.ID),
-			}
-			resp, err := e.client.DescribeServices(params)
-			if err != nil {
-				servC <- srvRes{nil, err}
-			}
 
+			var describeServicesResp []*ecs.Service
+
+			for i := 0; i<len(services)/maxDescribeServicesAPI; i++ {
+				st := i*maxDescribeServicesAPI
+				end = st+maxDescribeServicesAPI
+				if end > len(services) {
+					end = len(services)
+				}
+				params := &ecs.DescribeServicesInput{
+					Services: services[st:end],
+					Cluster:  aws.String(cluster.ID),
+				}
+
+				resp, err := e.client.DescribeServices(params)
+				if err != nil {
+					servC <- srvRes{nil, err}
+				}
+
+				//describeServicesResp = append(describeServicesResp[:], resp.Services[:)
+				describeServicesResp = append(describeServicesResp, resp.Services...)
+			}
+            
 			ss := []*types.ECSService{}
             
-			scalableTargets, err:= getScalableTargets(autoScalingClient, resp.Services, cluster.Name)
+			scalableTargets, err:= getScalableTargets(autoScalingClient, describeServicesResp, cluster.Name)
 			if err != nil {
 					servC <- srvRes{nil, err}
 			}
-			for _, s := range resp.Services {
+			for _, s := range describeServicesResp {
 				es := &types.ECSService{
 					ID:       aws.StringValue(s.ServiceArn),
 					Name:     aws.StringValue(s.ServiceName),
